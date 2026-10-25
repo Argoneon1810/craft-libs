@@ -289,8 +289,9 @@ fn declared_prefixes(xml: &str, start: usize) -> Vec<(usize, String)> {
 /// The prefix means nothing in XML, but some drivers' print pipelines read it as text: the job is
 /// accepted, then every page fails in the XPS print API (`0x80040003`, "No such interface
 /// supported"). A Brother driver names its namespace `brpsk` and fails with `ns0000`. Only the
-/// declarations and the vendor names in `name`/`constrained` attributes and QName values change;
-/// a ticket that redeclares one of the prefixes below its root is left as it is.
+/// declarations and the vendor names in `name`/`constrained` attributes and QName values change.
+/// A ticket is left as it is when it redeclares one of the prefixes below its root, or has an
+/// element or attribute named in a namespace whose prefix would change.
 pub(crate) fn respell(ticket: &str, driver: &str) -> Option<String> {
     let document = roxmltree::Document::parse(ticket).ok()?;
     let own = vendor_prefixes(&roxmltree::Document::parse(driver).ok()?);
@@ -320,6 +321,19 @@ pub(crate) fn respell(ticket: &str, driver: &str) -> Option<String> {
         .filter(|n| n.is_element() && *n != document.root_element())
         .any(|n| declared_prefixes(ticket, n.range().start).iter().any(|(_, prefix)| touched(prefix)));
     if redeclared {
+        return None;
+    }
+    // Changing the root's declarations moves every name written with one of these prefixes, and only
+    // the `name`/`constrained` values and QName values are rewritten to follow. An element or attribute
+    // name (`<ns0000:Feature/>`, `ns0000:flag="1"`) would not follow: it would be left with an undeclared
+    // prefix, or, when two namespaces trade prefixes, quietly resolve to the other namespace. Names
+    // in a namespace whose prefix stays as it is are not affected.
+    let moved: Vec<&str> = document.root_element().namespaces().filter(|n| n.name().is_some_and(touched)).map(|n| n.uri()).collect();
+    let names_moved = document.descendants().filter(|n| n.is_element()).any(|n| {
+        n.tag_name().namespace().is_some_and(|uri| moved.contains(&uri))
+            || n.attributes().any(|a| a.namespace().is_some_and(|uri| moved.contains(&uri)))
+    });
+    if names_moved {
         return None;
     }
     let respelled = |at: usize| {
@@ -352,8 +366,8 @@ pub(crate) fn respell(ticket: &str, driver: &str) -> Option<String> {
         copied = end;
     }
     out.push_str(ticket.get(copied..)?);
-    // The result must parse (a vendor element or attribute name would be left with an undeclared
-    // prefix), declare each namespace under the prefix wanted and resolve every prefix.
+    // A last check on the result: it must parse, declare each namespace under the prefix wanted and
+    // resolve every prefix.
     let check = roxmltree::Document::parse(&out).ok()?;
     let mut now = vendor_prefixes(&check);
     let mut wanted: Vec<(String, String)> = declared.iter().map(|(old, uri)| (renamed(old).unwrap_or(old).to_string(), uri.clone())).collect();
@@ -478,16 +492,76 @@ mod tests {
         assert_eq!(verify_ticket(&respell(&merged, &brother("brpsk")).unwrap(), Some(letter), false), Ok(letter));
     }
 
+    /// A second vendor namespace, next to [`BROTHER`].
+    const OTHER: &str = "http://example.com/other";
+
+    /// A ticket that names [`BROTHER`] with the prefix `a` and [`OTHER`] with `b` in its root, uses
+    /// each in a `name`, and ends with `extra`.
+    fn two_namespaces(a: &str, b: &str, extra: &str) -> String {
+        format!(
+            r#"<psf:PrintTicket xmlns:psf="{NS_PSF}" xmlns:psk="{NS_PSK}" xmlns:{a}="{BROTHER}" xmlns:{b}="{OTHER}"><psf:Feature name="{a}:One"/><psf:Feature name="{b}:Two"/>{extra}</psf:PrintTicket>"#
+        )
+    }
+
     /// Prefixes are renamed together, so two namespaces that swap prefixes still end up distinct.
     #[test]
     fn two_vendor_namespaces_can_trade_prefixes() {
-        let other = "http://example.com/other";
-        let ticket = |a: &str, b: &str| {
+        let ticket = |a: &str, b: &str| two_namespaces(a, b, "");
+        assert_eq!(respell(&ticket("ns0000", "ns0001"), &ticket("ns0001", "ns0000")), Some(ticket("ns0001", "ns0000")));
+    }
+
+    /// When two namespaces trade prefixes both prefixes stay declared, so a name that is only
+    /// written with a prefix (an element or an attribute, unlike a `name` value) would still parse and
+    /// resolve, but to the other namespace. Each ticket here is well-formed and has every prefix
+    /// declared, so `respell` leaves it alone for the name, not because the result didn't parse.
+    #[test]
+    fn a_swap_does_not_move_an_element_or_attribute_name_to_the_other_namespace() {
+        let driver = two_namespaces("ns0001", "ns0000", "");
+        let refused = |extra: &str| {
+            let ticket = two_namespaces("ns0000", "ns0001", extra);
+            let document = roxmltree::Document::parse(&ticket).expect("the fixture must stay well-formed");
+            assert!(prefixes_resolve(&document));
+            respell(&ticket, &driver)
+        };
+        assert!(refused("").is_some(), "control: the same ticket without such a name is respelled");
+
+        // An element: `ns0000:Feature` is BROTHER's until the declarations swap, then OTHER's.
+        assert_eq!(refused("<ns0000:Feature/>"), None, "element in the first namespace");
+        assert_eq!(refused("<ns0001:Feature/>"), None, "element in the second namespace");
+        assert_eq!(refused("<psf:Property name=\"ns0001:Three\"><ns0000:Child/></psf:Property>"), None, "nested element");
+
+        // An attribute, whichever element carries it.
+        assert_eq!(refused("<psf:Feature name=\"ns0000:Three\" ns0000:flag=\"1\"/>"), None, "attribute in the first namespace");
+        assert_eq!(refused("<psf:Feature name=\"ns0000:Three\" ns0001:flag=\"1\"/>"), None, "attribute in the second namespace");
+        assert_eq!(refused("<ns0001:Feature ns0000:flag=\"1\"/>"), None, "both at once");
+    }
+
+    /// The same when the prefixes form a chain rather than a swap: `brpsk` is OTHER's, is about to
+    /// become BROTHER's, and OTHER moves on to `ns0005`.
+    #[test]
+    fn a_name_in_a_namespace_whose_prefix_is_taken_over_is_not_respelled() {
+        let driver = two_namespaces("brpsk", "ns0005", "");
+        let refused = |extra: &str| {
+            let ticket = two_namespaces("ns0000", "brpsk", extra);
+            let document = roxmltree::Document::parse(&ticket).expect("the fixture must stay well-formed");
+            assert!(prefixes_resolve(&document));
+            respell(&ticket, &driver)
+        };
+        assert!(refused("").is_some(), "control");
+        assert_eq!(refused("<brpsk:Feature/>"), None, "element: OTHER's now, BROTHER's after");
+        assert_eq!(refused("<psf:Feature brpsk:flag=\"1\"/>"), None, "attribute");
+    }
+
+    /// Only names in a namespace whose prefix changes block the respelling.
+    #[test]
+    fn names_in_a_namespace_that_keeps_its_prefix_do_not_block_the_respelling() {
+        let keep = "http://example.com/keep";
+        let ticket = |prefix: &str| {
             format!(
-                r#"<psf:PrintTicket xmlns:psf="{NS_PSF}" xmlns:psk="{NS_PSK}" xmlns:{a}="{BROTHER}" xmlns:{b}="{other}"><psf:Feature name="{a}:One"/><psf:Feature name="{b}:Two"/></psf:PrintTicket>"#
+                r#"<psf:PrintTicket xmlns:psf="{NS_PSF}" xmlns:psk="{NS_PSK}" xmlns:{prefix}="{BROTHER}" xmlns:keep="{keep}"><psf:Feature name="{prefix}:One" keep:flag="1"><keep:Child keep:flag="2"/></psf:Feature><psf:Feature xmlns:own="http://example.com/own" own:flag="3"/></psf:PrintTicket>"#
             )
         };
-        assert_eq!(respell(&ticket("ns0000", "ns0001"), &ticket("ns0001", "ns0000")), Some(ticket("ns0001", "ns0000")));
+        assert_eq!(respell(&ticket("ns0000"), &ticket("brpsk")), Some(ticket("brpsk")));
     }
 
     /// Each ticket here is well-formed XML, so `respell` leaves it alone for the reason named, not
