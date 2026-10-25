@@ -217,10 +217,13 @@ mod tests {
         ticket::verify_job_options(std::str::from_utf8(ticket.get_xml()).unwrap(), &job, 1).unwrap();
         assert_eq!(paper, (215_900, 279_400));
         // The ticket names the driver's vendor namespaces as the driver does (the merge renamed them).
+        // `respell` returning `None` would not show it: it also does when it refused the ticket.
         let mut own = PrintTicketBuilder::new(&device).unwrap();
         own.merge(PrintTicket::from_xml(ticket::empty_ticket())).unwrap();
         let own = own.build().unwrap();
-        assert_eq!(ticket::respell(std::str::from_utf8(ticket.get_xml()).unwrap(), std::str::from_utf8(own.get_xml()).unwrap()), None);
+        let unlike =
+            ticket::prefixes_unlike_the_drivers(std::str::from_utf8(ticket.get_xml()).unwrap(), std::str::from_utf8(own.get_xml()).unwrap()).unwrap();
+        assert!(unlike.is_empty(), "vendor namespaces under another prefix than the driver's (namespace, ticket, driver): {unlike:?}");
         eprintln!("unprintable margin: {} pt", imageable_margin(&device, &ticket));
         if let Ok(path) = std::env::var("CRAFT_PRINT_TEST_TICKET_OUTPUT") {
             std::fs::write(path, ticket.get_xml()).unwrap();

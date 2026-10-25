@@ -376,6 +376,29 @@ pub(crate) fn respell(ticket: &str, driver: &str) -> Option<String> {
     (now == wanted && prefixes_resolve(&check)).then_some(out)
 }
 
+/// Each vendor namespace that `ticket` declares under a prefix the driver does not declare it with,
+/// as (namespace, prefix in the ticket, prefix of the driver); empty when the ticket is spelled the
+/// way the driver spells it. `driver` is the driver's own ticket ([`empty_ticket`] validated).
+/// `None` when either does not parse.
+///
+/// For checking the ticket a job ends up with. [`respell`] returning `None` for it does not: that
+/// is also what it returns when it refused to change a ticket, which then stays as it is.
+#[cfg(test)]
+pub(crate) fn prefixes_unlike_the_drivers(ticket: &str, driver: &str) -> Option<Vec<(String, String, String)>> {
+    let own = vendor_prefixes(&roxmltree::Document::parse(driver).ok()?);
+    let declared = vendor_prefixes(&roxmltree::Document::parse(ticket).ok()?);
+    Some(
+        declared
+            .into_iter()
+            .filter(|pair| !own.contains(pair))
+            .filter_map(|(prefix, uri)| {
+                let (theirs, _) = own.iter().find(|(_, u)| *u == uri)?;
+                Some((uri, prefix, theirs.clone()))
+            })
+            .collect(),
+    )
+}
+
 /// The widest unprintable margin of the paper, in micrometres, from PrintCapabilities computed
 /// for the job's ticket (`PageImageableSize`). The largest of the four, so content centred inside
 /// it is clear of every edge whichever way the driver measures. `None` when the driver doesn't say.
@@ -550,6 +573,41 @@ mod tests {
         assert!(refused("").is_some(), "control");
         assert_eq!(refused("<brpsk:Feature/>"), None, "element: OTHER's now, BROTHER's after");
         assert_eq!(refused("<psf:Feature brpsk:flag=\"1\"/>"), None, "attribute");
+    }
+
+    /// What the live driver test checks. A ticket `respell` refused keeps the prefix the merge gave
+    /// it, but `respell` says `None` for it, as it does for a ticket that is already right: only the
+    /// prefixes tell the two apart.
+    #[test]
+    fn the_prefixes_tell_a_refused_ticket_from_one_in_the_drivers_spelling() {
+        let driver = brother("brpsk");
+        let unlike = |ticket: &str| prefixes_unlike_the_drivers(ticket, &driver).expect("both tickets parse");
+        let merged = brother("ns0000");
+        let mismatch = (BROTHER.to_string(), "ns0000".to_string(), "brpsk".to_string());
+
+        assert_eq!(unlike(&merged), std::slice::from_ref(&mismatch), "as the merge returns it");
+        assert_eq!(unlike(&respell(&merged, &driver).unwrap()), [], "respelled");
+        assert_eq!(unlike(&driver), [], "already the driver's");
+
+        // `respell` refuses this one (`ns0000` is declared again below the root), so it stays as the
+        // merge left it, and `respell` says `None` for it just as it does for the driver's own.
+        let refused = merged.replace(
+            "<psf:Feature name=\"ns0000:JobPrintSpeed\">",
+            "<psf:Feature name=\"ns0000:JobPrintSpeed\" xmlns:ns0000=\"http://example.com/nested\">",
+        );
+        assert_ne!(refused, merged);
+        assert_eq!(respell(&refused, &driver), None);
+        assert_eq!(respell(&driver, &driver), None);
+        assert_eq!(unlike(&refused), [mismatch], "refused, and still wrong");
+
+        // Two namespaces that trade prefixes are both reported.
+        let traded = prefixes_unlike_the_drivers(&two_namespaces("ns0000", "ns0001", ""), &two_namespaces("ns0001", "ns0000", "")).unwrap();
+        assert_eq!(traded.len(), 2, "{traded:?}");
+        // A namespace the driver doesn't declare has no prefix of the driver's to differ from.
+        assert_eq!(unlike(&empty_ticket()), [], "no vendor namespace to compare");
+        assert_eq!(unlike(&two_namespaces("ns0000", "ns0001", "")).len(), 1, "only BROTHER is the driver's");
+        assert_eq!(prefixes_unlike_the_drivers("<not xml", &driver), None);
+        assert_eq!(prefixes_unlike_the_drivers(&merged, "<not xml"), None);
     }
 
     /// Only names in a namespace whose prefix changes block the respelling.
