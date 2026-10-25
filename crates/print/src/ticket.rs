@@ -206,8 +206,11 @@ pub(crate) fn verify_job_options(xml: &str, job: &Job, pages: usize) -> Result<(
     Ok(())
 }
 
+/// XML Schema instance namespace (`xsi:type`).
 const NS_XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
+/// XML Schema datatypes namespace (`xsd:integer`, `xsd:QName`).
 const NS_XSD: &str = "http://www.w3.org/2001/XMLSchema";
+/// The namespace XML itself binds to the `xml` prefix.
 const NS_XML: &str = "http://www.w3.org/XML/1998/namespace";
 
 /// A PrintTicket that sets nothing. Merged and validated by a driver it comes back as the
@@ -286,7 +289,8 @@ fn declared_prefixes(xml: &str, start: usize) -> Vec<(usize, String)> {
 /// The prefix means nothing in XML, but some drivers' print pipelines read it as text: the job is
 /// accepted, then every page fails in the XPS print API (`0x80040003`, "No such interface
 /// supported"). A Brother driver names its namespace `brpsk` and fails with `ns0000`. Only the
-/// declarations and the vendor names in `name`/`constrained` attributes and QName values change.
+/// declarations and the vendor names in `name`/`constrained` attributes and QName values change;
+/// a ticket that redeclares one of the prefixes below its root is left as it is.
 pub(crate) fn respell(ticket: &str, driver: &str) -> Option<String> {
     let document = roxmltree::Document::parse(ticket).ok()?;
     let own = vendor_prefixes(&roxmltree::Document::parse(driver).ok()?);
@@ -308,6 +312,16 @@ pub(crate) fn respell(ticket: &str, driver: &str) -> Option<String> {
     if after.len() != declared_count {
         return None;
     }
+    // Only the root's declarations are rewritten: an element below it that declares either prefix
+    // again would make a name mean something else once the prefixes change.
+    let touched = |prefix: &str| renames.iter().any(|(old, new)| prefix == *old || prefix == *new);
+    let redeclared = document
+        .descendants()
+        .filter(|n| n.is_element() && *n != document.root_element())
+        .any(|n| declared_prefixes(ticket, n.range().start).iter().any(|(_, prefix)| touched(prefix)));
+    if redeclared {
+        return None;
+    }
     let respelled = |at: usize| {
         let rest = ticket.get(at..)?;
         renames.iter().find(|(old, _)| rest.strip_prefix(old).is_some_and(|r| r.starts_with(':'))).map(|(old, new)| (at, at + old.len(), *new))
@@ -318,13 +332,8 @@ pub(crate) fn respell(ticket: &str, driver: &str) -> Option<String> {
             edits.push((at, at + prefix.len(), new));
         }
     }
-    let uses_renamed = |ns: Option<&str>| ns.is_some_and(|ns| declared.iter().any(|(old, uri)| uri == ns && renamed(old).is_some()));
     for node in document.descendants() {
         if node.is_element() {
-            // A vendor namespace used for an element or attribute is not re-spelled here.
-            if uses_renamed(node.tag_name().namespace()) || node.attributes().any(|a| uses_renamed(a.namespace())) {
-                return None;
-            }
             for a in
                 node.attributes().filter(|a| (a.namespace().is_none() && matches!(a.name(), "name" | "constrained")) || a.namespace() == Some(NS_XSI))
             {
@@ -343,7 +352,8 @@ pub(crate) fn respell(ticket: &str, driver: &str) -> Option<String> {
         copied = end;
     }
     out.push_str(ticket.get(copied..)?);
-    // The result must declare each namespace under the prefix wanted and resolve every prefix.
+    // The result must parse (a vendor element or attribute name would be left with an undeclared
+    // prefix), declare each namespace under the prefix wanted and resolve every prefix.
     let check = roxmltree::Document::parse(&out).ok()?;
     let mut now = vendor_prefixes(&check);
     let mut wanted: Vec<(String, String)> = declared.iter().map(|(old, uri)| (renamed(old).unwrap_or(old).to_string(), uri.clone())).collect();
@@ -443,6 +453,7 @@ mod tests {
         assert!(verify_ticket("<not xml", Some(letter), false).is_err());
     }
 
+    /// The namespace of the Brother driver's own keywords.
     const BROTHER: &str = "http://schemas.brother.info/mfc/printing/2006/11/printschemakeywords";
 
     /// A Brother driver's ticket with its vendor namespace declared as `prefix`. The driver's own
@@ -454,6 +465,7 @@ mod tests {
         )
     }
 
+    /// The ticket Windows returns (`ns0000`) gets the driver's own `brpsk` back, in the declaration, the names and the QName values, but not in text.
     #[test]
     fn a_vendor_namespace_gets_the_prefix_the_driver_declares_it_with() {
         let merged = brother("ns0000");
@@ -466,6 +478,7 @@ mod tests {
         assert_eq!(verify_ticket(&respell(&merged, &brother("brpsk")).unwrap(), Some(letter), false), Ok(letter));
     }
 
+    /// Prefixes are renamed together, so two namespaces that swap prefixes still end up distinct.
     #[test]
     fn two_vendor_namespaces_can_trade_prefixes() {
         let other = "http://example.com/other";
@@ -477,21 +490,38 @@ mod tests {
         assert_eq!(respell(&ticket("ns0000", "ns0001"), &ticket("ns0001", "ns0000")), Some(ticket("ns0001", "ns0000")));
     }
 
+    /// Each ticket here is well-formed XML, so `respell` leaves it alone for the reason named, not
+    /// because it didn't parse.
     #[test]
     fn a_ticket_that_cannot_be_respelled_safely_is_left_alone() {
         let merged = brother("ns0000");
+        let driver = brother("brpsk");
+        let refused = |ticket: &str| {
+            assert!(roxmltree::Document::parse(ticket).is_ok(), "the fixture must stay well-formed");
+            respell(ticket, &driver)
+        };
         assert_eq!(respell(&merged, &empty_ticket()), None, "the driver has no such namespace");
-        assert_eq!(respell("<not xml", &brother("brpsk")), None);
+        assert_eq!(respell("<not xml", &driver), None);
         assert_eq!(respell(&merged, "<not xml"), None);
         // `brpsk` is already another namespace's prefix in the ticket.
-        let taken = merged.replace("xmlns:psk=", "xmlns:brpsk=\"http://example.com/other\" xmlns:psk=");
-        assert_eq!(respell(&taken, &brother("brpsk")), None);
+        assert_eq!(refused(&merged.replace("xmlns:psk=", "xmlns:brpsk=\"http://example.com/other\" xmlns:psk=")), None);
         // A vendor element can't be renamed by changing attributes and declarations.
-        let element = merged.replace("<psf:Feature name=\"ns0000:JobPrintSpeed\">", "<ns0000:Feature>");
-        assert_eq!(respell(&element, &brother("brpsk")), None);
+        let feature = "<psf:Feature name=\"ns0000:JobPrintSpeed\"><psf:Option name=\"ns0000:PrinterDefault\"/></psf:Feature>";
+        assert!(merged.contains(feature));
+        assert_eq!(refused(&merged.replace(feature, "<ns0000:Feature/>")), None);
         // A name whose prefix is not declared stays refused after the change.
-        let dangling = merged.replace("name=\"ns0000:Mode\"", "name=\"ns0001:Mode\"");
-        assert_eq!(respell(&dangling, &brother("brpsk")), None);
+        assert_eq!(refused(&merged.replace("name=\"ns0000:Mode\"", "name=\"ns0001:Mode\"")), None);
+        // A nested element that declares either prefix again would change what a name resolves to.
+        for redeclared in ["ns0000", "brpsk"] {
+            let nested = merged.replace(
+                "<psf:Feature name=\"ns0000:JobPrintSpeed\">",
+                &format!("<psf:Feature name=\"ns0000:JobPrintSpeed\" xmlns:{redeclared}=\"http://example.com/nested\">"),
+            );
+            assert_ne!(nested, merged);
+            assert_eq!(refused(&nested), None, "{redeclared} declared again below the root");
+        }
+        // Control: the same ticket without the nested declaration is respelled.
+        assert!(refused(&merged).is_some());
     }
 
     #[test]
