@@ -34,6 +34,10 @@ craft-<name> = { git = "https://github.com/storytold/craft-libs", rev = "<commit
 - [`craft-cms`](crates/cms/README.md): pure-Rust ICC v2/v4 colour management: profile parsing
   and writing, transforms, rendering intents, black point compensation, soft proofing, gamut
   checks, 3D LUTs and built-in profiles (sRGB, Display P3, synthetic coated CMYK and others).
+- [`craft-dialogs`](crates/dialogs/README.md): native file and message dialogs that never block
+  the event loop: queued requests shown at the end of the frame and answered on a later frame,
+  free-standing Open and Folder panels and Save sheets on macOS, case-insensitive filters. What
+  to do with the answer stays in each app.
 - [`craft-docpath`](crates/docpath/src/lib.rs): decides whether a path or `file:` URL stored in a
   document may be opened. Paths stored in documents are followed only when they are local or on the
   document's own network share; other network paths, device paths and non-file URLs are refused.
