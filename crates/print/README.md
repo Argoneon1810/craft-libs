@@ -23,8 +23,11 @@ opens Windows printer preferences and submits jobs with copies, collation, duple
   orientation and "no scaling" travel in a PrintTicket that the driver validates first; a
   driver that would change the paper, orientation or scaling is refused before anything is
   sent. Paper is the driver's own option for the sheet's size (to 0.25 mm), preferring the one
-  named like the standard size ("ARCH D" over a custom 24 × 36 in entry). This backend comes
-  from storytold/pdfcraft#599 and #1132.
+  named like the standard size ("ARCH D" over a custom 24 × 36 in entry). Windows' ticket merge
+  renames a driver's vendor namespace prefix (`brpsk` to `ns0000`) once the ticket uses one of
+  its names, and a Brother driver then fails every page with `0x80040003`; the validated ticket
+  is given the prefixes of the driver's own default ticket back (`ticket::respell`). This backend
+  comes from storytold/pdfcraft#599 and #1132.
   A job has one ticket, so one paper and orientation. Sheets of the other orientation are
   turned back with `/Rotate`, so portrait and landscape sheets still print as one job. Exact
   size refuses sheets of different sizes and paper the driver lacks. Shrink-to-fit uses the
