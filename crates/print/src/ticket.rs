@@ -354,7 +354,10 @@ pub(crate) fn respell(ticket: &str, driver: &str) -> Option<String> {
                 edits.extend(respelled(a.range_value().start));
             }
         } else if node.is_text() && node.parent().is_some_and(is_qname_value) {
-            edits.extend(respelled(node.range().start));
+            // A pretty-printed ticket puts whitespace before the value; the prefix starts after it.
+            let start = node.range().start;
+            let lead = ticket.get(start..).map_or(0, |t| t.len() - t.trim_start().len());
+            edits.extend(respelled(start + lead));
         }
     }
     edits.sort_unstable_by_key(|(start, ..)| *start);
@@ -500,6 +503,13 @@ mod tests {
         format!(
             r#"<psf:PrintTicket xmlns:psf="{NS_PSF}" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" version="1" xmlns:psk="{NS_PSK}" xmlns:{prefix}="{BROTHER}"><psf:Feature name="psk:PageMediaSize"><psf:Option name="psk:NorthAmericaLetter"><psf:ScoredProperty name="psk:MediaSizeWidth"><psf:Value xsi:type="xsd:integer">215900</psf:Value></psf:ScoredProperty><psf:ScoredProperty name="psk:MediaSizeHeight"><psf:Value xsi:type="xsd:integer">279400</psf:Value></psf:ScoredProperty></psf:Option></psf:Feature><psf:Feature name="psk:PageOrientation"><psf:Option name="psk:Portrait"/></psf:Feature><psf:Property name="{prefix}:PageMediaSizeData"><psf:Property name="{prefix}:CustomUnitType"><psf:Value xsi:type="xsd:string">mm</psf:Value></psf:Property></psf:Property><psf:Feature name="{prefix}:JobPrintSpeed"><psf:Option name="{prefix}:PrinterDefault"/></psf:Feature><psf:ParameterInit name="{prefix}:Mode"><psf:Value xsi:type="xsd:QName">{prefix}:Fast</psf:Value></psf:ParameterInit><psf:ParameterInit name="{prefix}:Label"><psf:Value xsi:type="xsd:string">ns0000:text, not a name</psf:Value></psf:ParameterInit></psf:PrintTicket>"#
         )
+    }
+
+    /// A QName value written after whitespace (a pretty-printed ticket) is respelled too.
+    #[test]
+    fn a_qname_value_after_whitespace_is_respelled() {
+        let spaced = |prefix: &str| brother(prefix).replace(&format!(">{prefix}:Fast<"), &format!(">\n  {prefix}:Fast\n<"));
+        assert_eq!(respell(&spaced("ns0000"), &brother("brpsk")), Some(spaced("brpsk")));
     }
 
     /// The ticket Windows returns (`ns0000`) gets the driver's own `brpsk` back, in the declaration, the names and the QName values, but not in text.
