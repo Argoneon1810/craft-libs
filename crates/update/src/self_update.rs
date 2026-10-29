@@ -305,8 +305,9 @@ pub fn update(
 ) -> Result<(), String> {
     let cur_v = running_version.and_then(|v| current_version(app, v));
     if let (Some(rel_v), Some(cur_v)) = (release.version.as_ref(), cur_v.as_ref())
-        && !version::is_newer(rel_v, cur_v)
+        && !version::offers_update(rel_v, cur_v)
     {
+        // A build from source is only replaced by a strictly higher release (see `offers_update`).
         return Err(format!("{} {} is not newer than currently running version {}", app.name, release.version_label(), cur_v));
     }
     let (asset, _) = pick_asset(release, &[app.id], platform, &[install.kind()])
@@ -1735,6 +1736,23 @@ mod tests {
         let platform = Platform { os: Os::Linux, arch: Arch::X64 };
         let result = update(&crate::suite::LAUNCHER, &install, &release, platform, &http, &paths, &stop, &mut phase, &last, Some("0.2.0"));
         assert!(result.is_err());
+        assert!(result.unwrap_err().contains("is not newer than currently running version"));
+    }
+
+    #[test]
+    fn a_build_from_main_refuses_to_install_the_release_it_already_contains() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let http = Http::new(crate::TEST_AGENT).unwrap();
+        let mut phase = |_| ();
+        let last = || Ok(());
+        let stop = Stop::default();
+        let release = Release { version: version::parse("0.2.0"), tag: "v0.2.0".into(), ..Release::default() };
+        let install = Install::AppImage(dir.path().join("launcher.AppImage"));
+        use crate::{Arch, Os};
+        let platform = Platform { os: Os::Linux, arch: Arch::X64 };
+        let running = Some("0.2.0-integration.20261029.f5b3f123");
+        let result = update(&crate::suite::LAUNCHER, &install, &release, platform, &http, &paths, &stop, &mut phase, &last, running);
         assert!(result.unwrap_err().contains("is not newer than currently running version"));
     }
 
