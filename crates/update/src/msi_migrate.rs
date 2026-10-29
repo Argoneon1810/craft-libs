@@ -32,12 +32,21 @@ pub(crate) enum Step {
     Move { product_code: String, folder: PathBuf, old_folder: PathBuf },
 }
 
-/// Where this account's files live: `USERPROFILE`, `LOCALAPPDATA` and `APPDATA`, which may be
-/// redirected away from one another.
+/// Where this account's files live. `roots` are `USERPROFILE`, `LOCALAPPDATA` and `APPDATA`, which
+/// may be redirected away from one another; `defaults` are the app's per-user default folders
+/// ([`default_folders`]). All resolved the way the exe's folder is, so links and `subst` drives
+/// compare as the same place.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Profile {
     pub roots: Vec<PathBuf>,
-    pub local_app_data: Option<PathBuf>,
+    pub defaults: Vec<PathBuf>,
+}
+
+/// The per-user default folders of `app_name` under `local_app_data`: the suite folder
+/// `Programs\ArtCraft\<App>`, then the older `Programs\<App>`.
+pub(crate) fn default_folders(local_app_data: &Path, app_name: &str) -> [PathBuf; 2] {
+    let programs = local_app_data.join("Programs");
+    [programs.join("ArtCraft").join(app_name), programs.join(app_name)]
 }
 
 /// The step for a copy whose exe is in `dir`. `resolved` is its confirmed context and product
@@ -49,11 +58,7 @@ pub(crate) fn plan(resolved: Option<(MsiScope, String)>, dir: &Path, app_name: &
         return Step::Update(scope_arguments(scope));
     }
     let stay = Step::Update(scope_arguments(MsiScope::PerUser));
-    let defaults = profile.local_app_data.iter().flat_map(|local| {
-        let programs = local.join("Programs");
-        [programs.join("ArtCraft").join(app_name), programs.join(app_name)]
-    });
-    let folder = if defaults.into_iter().any(|default| same_path(&default, dir)) {
+    let folder = if profile.defaults.iter().any(|default| same_path(default, dir)) {
         match program_files {
             Some(root) => root.join("ArtCraft").join(app_name),
             None => return stay,
@@ -124,11 +129,14 @@ pub(crate) mod windows {
         let resolved = crate::msi_copy::windows::resolve(app, exe)?;
         let dir = exe.parent().ok_or_else(|| format!("{} isn't in a folder", app.name))?;
         let dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        // Resolved like `dir`, so a profile behind a junction or a `subst` drive still matches.
+        // Resolved like `dir`, whole path at a time, so a profile or a default folder reached
+        // through a junction or a `subst` drive still matches.
         let canonical = |p: PathBuf| dunce::canonicalize(&p).unwrap_or(p);
         let profile = Profile {
             roots: ["USERPROFILE", "LOCALAPPDATA", "APPDATA"].into_iter().filter_map(env_path).map(canonical).collect(),
-            local_app_data: crate::folders::data_local_dir().map(canonical),
+            defaults: crate::folders::data_local_dir()
+                .map(|local| super::default_folders(&local, app.name).into_iter().map(canonical).collect())
+                .unwrap_or_default(),
         };
         // This process has the package's architecture (the helper is a copy of the app), so its
         // own `ProgramFiles` is the right root: `Program Files (x86)` for a 32-bit app.
@@ -165,8 +173,26 @@ mod tests {
     fn profile() -> Profile {
         Profile {
             roots: vec![p(r"C:\Users\Ann"), p(r"C:\Users\Ann\AppData\Local"), p(r"C:\Users\Ann\AppData\Roaming")],
-            local_app_data: Some(p(r"C:\Users\Ann\AppData\Local")),
+            defaults: [r"C:\Users\Ann\AppData\Local\Programs\ArtCraft\GridCraft", r"C:\Users\Ann\AppData\Local\Programs\GridCraft"].map(p).to_vec(),
         }
+    }
+
+    #[test]
+    fn the_default_folders_are_the_suite_folder_then_the_older_one() {
+        let local = p(r"C:\Users\Ann\AppData\Local");
+        let expected = [local.join("Programs").join("ArtCraft").join("GridCraft"), local.join("Programs").join("GridCraft")];
+        assert_eq!(default_folders(&local, "GridCraft"), expected);
+    }
+
+    #[test]
+    fn a_default_folder_reached_through_a_link_still_moves_to_the_suite_folder() {
+        // The Windows layer resolves each default folder whole, so a linked `Programs` arrives
+        // here as the real path the exe's folder also resolves to.
+        let old = r"D:\Redirected\Programs\ArtCraft\GridCraft";
+        let linked = Profile { defaults: vec![p(old)], ..profile() };
+        let suite = pf().map(|root| root.join("ArtCraft").join("GridCraft")).unwrap();
+        let expected = Step::Move { product_code: CODE.to_string(), folder: suite, old_folder: p(old) };
+        assert_eq!(plan(user(), &p(old), "GridCraft", &linked, pf()), expected);
     }
 
     fn user() -> Option<(MsiScope, String)> {
