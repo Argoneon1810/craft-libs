@@ -9,7 +9,7 @@
 //! | Installed as | Swap |
 //! |---|---|
 //! | macOS `.app` | copy the new bundle from the DMG over this one (fine while running), reopen it |
-//! | Windows MSI (per-user, any folder) | after exit, run the new MSI (it reinstalls into the same folder), then start the exe |
+//! | Windows MSI (any folder, for one account or everyone) | after exit, run the new MSI in the copy's own context (everyone asks for permission), then start the exe it registers |
 //! | Windows portable zip | after exit, unzip over this folder (settings in `ArtCraftLauncherData` stay) |
 //! | Linux AppImage | rename the new AppImage over this one (fine while running), start it |
 //! | Linux `.deb` / `.rpm` | the system package manager, with the password prompt; then restart |
@@ -188,12 +188,9 @@ fn detect(app: &App, exe: &Path) -> Option<Install> {
     if dir.join("portable.txt").is_file() {
         return Some(Install::Portable(exe.to_path_buf()));
     }
-    // The MSI installs per user, into the folder chosen in its wizard (which it records in the
-    // registry) or by default %LOCALAPPDATA%\Programs\<App Name>.
-    let canonical = |p: PathBuf| p.canonicalize().unwrap_or(p);
-    let recorded = msi_install_dir(app).map(canonical);
-    let default = crate::folders::data_local_dir().map(|d| canonical(d.join("Programs").join(app.name)));
-    if [recorded, default].into_iter().flatten().any(|d| d == dir) {
+    // Any folder, either context: the MSI's own registration says so (see `msi_copy`). A copy
+    // installed for everyone must never be unpacked over as if it were a loose folder.
+    if crate::msi_copy::windows::find(app, exe).is_some() {
         return Some(Install::Msi(exe.to_path_buf()));
     }
     if exe.is_file() {
@@ -202,16 +199,22 @@ fn detect(app: &App, exe: &Path) -> Option<Install> {
     None
 }
 
-/// The folder the MSI installed into, as it records it.
+/// The `msiexec` properties that keep `exe`'s Windows Installer context, or why its update stops.
+/// Asked while the app still runs (so it can show the error) and again by the helper.
 #[cfg(windows)]
-fn msi_install_dir(app: &App) -> Option<PathBuf> {
-    use winreg::RegKey;
-    use winreg::enums::HKEY_CURRENT_USER;
-    let subkey = format!(r"Software\Learning Machines LLC\{}", app.name);
-    let key = RegKey::predef(HKEY_CURRENT_USER).open_subkey(&subkey).ok()?;
-    let dir: String = key.get_value("InstallDir").ok()?;
-    let dir = dir.trim();
-    (!dir.is_empty()).then(|| PathBuf::from(dir))
+fn msi_arguments(app: &App, exe: &Path) -> Result<&'static [&'static str], String> {
+    crate::msi_copy::windows::update_arguments(app, exe)
+}
+
+/// The exe to start after an MSI update of a registered copy: the one its registrations name now
+/// (the package may have moved an exact old default folder), else `exe`.
+#[cfg(windows)]
+fn exe_after_msi(app: &App, registered: bool, exe: &Path) -> PathBuf {
+    registered
+        .then(|| crate::msi_copy::registered_exe(&crate::msi_copy::windows::registered_exes(app)))
+        .flatten()
+        .filter(|moved| is_own_executable(app, moved))
+        .unwrap_or_else(|| exe.to_path_buf())
 }
 
 #[cfg(target_os = "linux")]
@@ -628,11 +631,15 @@ pub fn finish(app: &App, args: &[OsString]) -> Option<Result<(), String>> {
         record_failure(&paths, &e);
         return Some(Err(e));
     }
+    // Read before the step: the update may move or replace the old exe.
+    let registered =
+        matches!(step, Finish::Msi(_)) && matches!(crate::msi_copy::windows::find(app, &exe), Some(crate::msi_copy::MsiCopy::Registered { .. }));
     let done = run_step(app, &me, pid, &exe, &step, std::time::Duration::from_secs(60));
     if let Err(e) = &done {
         record_failure(&paths, e);
     }
     // The new app, or the old one when the step failed.
+    let exe = if done.is_ok() { exe_after_msi(app, registered, &exe) } else { exe };
     let started = signed_like(app, &me, &exe)
         .and_then(|()| process::spawn_detached(std::process::Command::new(&exe)).map_err(|e| format!("couldn't start {} ({e})", exe.display())));
     if let Err(e) = &started {
@@ -688,6 +695,7 @@ fn windows_precheck(app: &App, install: &Install, paths: &Paths, download: &Path
     let me = std::env::current_exe().map_err(|e| format!("couldn't find this program ({e})"))?;
     match install {
         Install::Msi(exe) => signed_like(app, &me, exe)
+            .and_then(|()| msi_arguments(app, exe).map(drop))
             .and_then(|()| signed_like(app, &me, download))
             .and_then(|()| own_executable(app, exe))
             .and_then(|()| same_cache_as_helper(app, paths, exe)),
@@ -824,7 +832,9 @@ fn run_step(app: &App, reference: &Path, pid: u32, exe: &Path, step: &Finish, wa
     wait_watch::returned(pid, waited);
     let result = if waited {
         match step {
-            Finish::Msi(msi) => signed_like(app, reference, msi).and_then(|()| install::windows::reinstall(msi)),
+            Finish::Msi(msi) => signed_like(app, reference, msi)
+                .and_then(|()| msi_arguments(app, exe))
+                .and_then(|arguments| install::windows::reinstall(msi, arguments)),
             Finish::Portable { zip, tmp } => match (exe.parent(), exe.file_name()) {
                 (Some(dir), Some(executable)) => crate::portable::unpack_over(zip, tmp, dir, executable, &|file| {
                     // The expected executable must be signed even when its contents aren't a PE file.
