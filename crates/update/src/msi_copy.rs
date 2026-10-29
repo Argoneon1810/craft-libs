@@ -15,7 +15,8 @@
 //! and a per-user copy never gains a second, per-machine twin or takes another copy's context.
 //!
 //! The launcher's own per-user MSI is still recognised by the folder it records in HKCU (or its
-//! default folder) and updated exactly as before, with the package's own default context.
+//! default folder) and updated exactly as before, with the package's own default context. An app
+//! copy in that kind of folder is judged by its registration first ([`classify`]).
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
@@ -60,6 +61,18 @@ pub(crate) fn update_arguments(
         return Err(ANOTHER_COPY.into());
     }
     Ok(crate::msi_context::scope_arguments(scope))
+}
+
+/// How a copy was installed, from what is known about it. The launcher's own per-user package in
+/// its recorded or default folder keeps its update exactly as before, whatever else is registered
+/// (a stale second record must not stop it). An app is judged by its `App Paths` registration
+/// first, so a registered copy always passes the context checks; the folder rule only covers an
+/// app copy that no registration names. `registration` is only read when it can decide.
+pub(crate) fn classify(is_launcher: bool, in_legacy_folder: bool, registration: impl FnOnce() -> Option<MsiCopy>) -> Option<MsiCopy> {
+    if is_launcher && in_legacy_folder {
+        return Some(MsiCopy::Legacy);
+    }
+    registration().or_else(|| in_legacy_folder.then_some(MsiCopy::Legacy))
 }
 
 /// Which registrations name `exe`. `registered` holds every `App Paths` target with the context
@@ -134,11 +147,8 @@ pub(crate) mod windows {
     /// How `exe` was installed by an MSI, or `None` when it wasn't. Reads the registry only.
     pub(crate) fn find(app: &App, exe: &Path) -> Option<MsiCopy> {
         let exe = canonical(exe);
-        // The launcher first, so its own per-user updates are exactly as before.
-        if is_legacy(app, &exe) {
-            return Some(MsiCopy::Legacy);
-        }
-        match_registration(&exe, &registered_exes(app))
+        let is_launcher = app.id == crate::suite::LAUNCHER.id;
+        super::classify(is_launcher, is_legacy(app, &exe), || match_registration(&exe, &registered_exes(app)))
     }
 
     /// The `msiexec` properties for `exe`'s update, asking Windows Installer for its context.
@@ -242,6 +252,23 @@ mod tests {
         assert!(update_arguments(copy, &[], |_| panic!("must not look up")).is_err());
         let two = codes(&[CODE, "{0BE5923F-1AAB-4240-8174-2F0CCC05E14C}"]);
         assert!(update_arguments(copy, &two, |_| panic!("must not look up")).is_err());
+    }
+
+    #[test]
+    fn the_launcher_in_its_own_folder_keeps_its_old_path_whatever_is_registered() {
+        let registered = Some(MsiCopy::Registered { hive: MsiScope::PerUser });
+        assert_eq!(classify(true, true, || registered), Some(MsiCopy::Legacy));
+        assert_eq!(classify(true, false, || registered), registered);
+        assert_eq!(classify(true, false, || None), None);
+    }
+
+    #[test]
+    fn an_app_in_the_old_per_user_folder_is_judged_by_its_registration_first() {
+        for registered in [MsiCopy::Registered { hive: MsiScope::PerUser }, MsiCopy::Conflicting] {
+            assert_eq!(classify(false, true, || Some(registered)), Some(registered));
+        }
+        assert_eq!(classify(false, true, || None), Some(MsiCopy::Legacy));
+        assert_eq!(classify(false, false, || None), None);
     }
 
     #[test]
