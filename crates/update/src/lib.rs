@@ -12,6 +12,7 @@ pub mod install;
 pub mod manifest;
 pub mod msi_context;
 mod msi_copy;
+mod msi_migrate;
 pub mod packages;
 pub mod paths;
 pub mod platform;

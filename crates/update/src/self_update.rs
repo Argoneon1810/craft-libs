@@ -201,11 +201,11 @@ fn detect(app: &App, exe: &Path) -> Option<Install> {
     None
 }
 
-/// The `msiexec` properties that keep `exe`'s Windows Installer context, or why its update stops.
-/// Asked while the app still runs (so it can show the error) and again by the helper.
+/// What `exe`'s MSI update does (update in place, or move a per-user copy to everyone), or why it
+/// stops. Asked while the app still runs (so it can show the error) and again by the helper.
 #[cfg(windows)]
-fn msi_arguments(app: &App, exe: &Path) -> Result<&'static [&'static str], String> {
-    crate::msi_copy::windows::update_arguments(app, exe)
+fn msi_step(app: &App, exe: &Path) -> Result<crate::msi_migrate::Step, String> {
+    crate::msi_migrate::windows::step(app, exe)
 }
 
 /// The exe to start after an MSI update of a registered copy: the one its registrations name now
@@ -697,7 +697,7 @@ fn windows_precheck(app: &App, install: &Install, paths: &Paths, download: &Path
     let me = std::env::current_exe().map_err(|e| format!("couldn't find this program ({e})"))?;
     match install {
         Install::Msi(exe) => signed_like(app, &me, exe)
-            .and_then(|()| msi_arguments(app, exe).map(drop))
+            .and_then(|()| msi_step(app, exe).map(drop))
             .and_then(|()| signed_like(app, &me, download))
             .and_then(|()| own_executable(app, exe))
             .and_then(|()| same_cache_as_helper(app, paths, exe)),
@@ -834,9 +834,9 @@ fn run_step(app: &App, reference: &Path, pid: u32, exe: &Path, step: &Finish, wa
     wait_watch::returned(pid, waited);
     let result = if waited {
         match step {
-            Finish::Msi(msi) => signed_like(app, reference, msi)
-                .and_then(|()| msi_arguments(app, exe))
-                .and_then(|arguments| install::windows::reinstall(msi, arguments)),
+            Finish::Msi(msi) => {
+                signed_like(app, reference, msi).and_then(|()| msi_step(app, exe)).and_then(|step| crate::msi_migrate::windows::run(msi, &step))
+            }
             Finish::Portable { zip, tmp } => match (exe.parent(), exe.file_name()) {
                 (Some(dir), Some(executable)) => crate::portable::unpack_over(zip, tmp, dir, executable, &|file| {
                     // The expected executable must be signed even when its contents aren't a PE file.
