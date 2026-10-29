@@ -201,11 +201,18 @@ fn detect(app: &App, exe: &Path) -> Option<Install> {
     None
 }
 
-/// The `msiexec` properties that keep `exe`'s Windows Installer context, or why its update stops.
-/// Asked while the app still runs (so it can show the error) and again by the helper.
+/// What `exe`'s MSI update does (update in place, or move a per-user copy to everyone), or why it
+/// stops. Asked while the app still runs (so it can show the error) and again by the helper.
 #[cfg(windows)]
-fn msi_arguments(app: &App, exe: &Path) -> Result<&'static [&'static str], String> {
-    crate::msi_copy::windows::update_arguments(app, exe)
+fn msi_step(app: &App, exe: &Path) -> Result<crate::msi_migrate::Step, String> {
+    crate::msi_migrate::windows::step(app, exe)
+}
+
+/// Whether the helper starts the app after the update step: always after a successful one, and
+/// after a failed one only while its exe is still there.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn restarts(step_succeeded: bool, exe_exists: bool) -> bool {
+    step_succeeded || exe_exists
 }
 
 /// The exe to start after an MSI update of a registered copy: the one its registrations name now
@@ -643,6 +650,11 @@ pub fn finish(app: &App, args: &[OsString]) -> Option<Result<(), String>> {
     }
     // The new app, or the old one when the step failed.
     let exe = if done.is_ok() { exe_after_msi(app, registered, &exe) } else { exe };
+    // A failed move can leave no program to start; its recorded error already says how to get
+    // the app back, and a restart error must not replace it.
+    if !restarts(done.is_ok(), exe.is_file()) {
+        return Some(done);
+    }
     let started = signed_like(app, &me, &exe)
         .and_then(|()| process::spawn_detached(std::process::Command::new(&exe)).map_err(|e| format!("couldn't start {} ({e})", exe.display())));
     if let Err(e) = &started {
@@ -698,7 +710,7 @@ fn windows_precheck(app: &App, install: &Install, paths: &Paths, download: &Path
     let me = std::env::current_exe().map_err(|e| format!("couldn't find this program ({e})"))?;
     match install {
         Install::Msi(exe) => signed_like(app, &me, exe)
-            .and_then(|()| msi_arguments(app, exe).map(drop))
+            .and_then(|()| msi_step(app, exe).map(drop))
             .and_then(|()| signed_like(app, &me, download))
             .and_then(|()| own_executable(app, exe))
             .and_then(|()| same_cache_as_helper(app, paths, exe)),
@@ -835,9 +847,9 @@ fn run_step(app: &App, reference: &Path, pid: u32, exe: &Path, step: &Finish, wa
     wait_watch::returned(pid, waited);
     let result = if waited {
         match step {
-            Finish::Msi(msi) => signed_like(app, reference, msi)
-                .and_then(|()| msi_arguments(app, exe))
-                .and_then(|arguments| install::windows::reinstall(msi, arguments)),
+            Finish::Msi(msi) => {
+                signed_like(app, reference, msi).and_then(|()| msi_step(app, exe)).and_then(|step| crate::msi_migrate::windows::run(msi, &step))
+            }
             Finish::Portable { zip, tmp } => match (exe.parent(), exe.file_name()) {
                 (Some(dir), Some(executable)) => crate::portable::unpack_over(zip, tmp, dir, executable, &|file| {
                     // The expected executable must be signed even when its contents aren't a PE file.
@@ -1722,6 +1734,14 @@ mod tests {
         assert_eq!(pick(Os::Linux, Install::Package(PackageKind::Deb, PathBuf::new()).kind()).as_deref(), Some(names[4]));
         assert_eq!(pick(Os::Linux, Install::Flatpak.kind()).as_deref(), Some(names[5]));
         assert_eq!(pick(Os::Linux, Install::Package(PackageKind::ArchPkg, PathBuf::new()).kind()).as_deref(), Some(names[6]));
+    }
+
+    #[test]
+    fn a_failed_step_that_removed_the_app_starts_nothing_and_keeps_its_message() {
+        assert!(restarts(true, true));
+        assert!(restarts(true, false));
+        assert!(restarts(false, true));
+        assert!(!restarts(false, false));
     }
 
     #[test]

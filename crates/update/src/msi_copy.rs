@@ -42,20 +42,32 @@ const ANOTHER_COPY: &str = "Windows lists this app for a different account setti
 const NOT_ONE_PRODUCT: &str =
     "Windows lists this app's installation more than once or not at all, so it can't tell which copy to update. Use the app's installer instead.";
 
-/// The `msiexec` properties for `copy`'s update. `product_codes` are the app's Windows Installer
+/// The `msiexec` properties for `copy`'s update (as [`crate::msi_migrate`] uses them). `product_codes` are the app's Windows Installer
 /// registrations; `probe` asks Windows Installer for one product's context, and `record_scopes`
 /// lists the context of every uninstall record of that product, read only when the lookup cannot
 /// run. Exactly one product must be registered: with two, either could be the copy that runs. The
 /// records must agree on one context. Whichever answers, it must be the context of the hive that
 /// named this exe, or the registration is another copy's.
+#[cfg(test)]
 pub(crate) fn update_arguments(
     copy: MsiCopy,
     product_codes: &[String],
     probe: impl FnOnce(&str) -> Result<MsiScope, crate::msi_context::ProbeError>,
     record_scopes: impl FnOnce(&str) -> Vec<MsiScope>,
 ) -> Result<&'static [&'static str], String> {
+    Ok(resolve(copy, product_codes, probe, record_scopes)?.map_or(&[][..], |(scope, _)| crate::msi_context::scope_arguments(scope)))
+}
+
+/// The confirmed context and product code of `copy`, by the rules of [`update_arguments`]. `None`
+/// for the launcher's own package, which keeps its package default and is never moved.
+pub(crate) fn resolve(
+    copy: MsiCopy,
+    product_codes: &[String],
+    probe: impl FnOnce(&str) -> Result<MsiScope, crate::msi_context::ProbeError>,
+    record_scopes: impl FnOnce(&str) -> Vec<MsiScope>,
+) -> Result<Option<(MsiScope, String)>, String> {
     let hive = match copy {
-        MsiCopy::Legacy => return Ok(&[]),
+        MsiCopy::Legacy => return Ok(None),
         MsiCopy::Conflicting => return Err(CONFLICTING.into()),
         MsiCopy::Registered { hive } => hive,
     };
@@ -65,7 +77,7 @@ pub(crate) fn update_arguments(
     if scope != hive {
         return Err(ANOTHER_COPY.into());
     }
-    Ok(crate::msi_context::scope_arguments(scope))
+    Ok(Some((scope, code.clone())))
 }
 
 /// How a copy was installed, from what is known about it. The launcher's own per-user package in
@@ -156,15 +168,16 @@ pub(crate) mod windows {
         super::classify(is_launcher, is_legacy(app, &exe), || match_registration(&exe, &registered_exes(app)))
     }
 
-    /// The `msiexec` properties for `exe`'s update, asking Windows Installer for its context.
-    pub(crate) fn update_arguments(app: &App, exe: &Path) -> Result<&'static [&'static str], String> {
+    /// The confirmed context and product code of `exe`'s copy, asking Windows Installer; `None`
+    /// for the launcher's own package. See [`super::resolve`].
+    pub(crate) fn resolve(app: &App, exe: &Path) -> Result<Option<(MsiScope, String)>, String> {
         let copy = find(app, exe).ok_or_else(|| format!("{} isn't registered with the Windows Installer", app.name))?;
         let codes: Vec<String> = crate::detect::windows::msi_installs(app)
             .into_iter()
             .map(|m| m.product_code)
             .filter(|code| crate::msi_context::valid_product_code(code))
             .collect();
-        super::update_arguments(copy, &codes, crate::msi_context::probe, record_scopes)
+        super::resolve(copy, &codes, crate::msi_context::probe, record_scopes)
     }
 
     /// The context of every uninstall record of `code`: the machine's (both registry views) are
