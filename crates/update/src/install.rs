@@ -1645,6 +1645,15 @@ fn msi_command(program: &Path, msi: &Path) -> Result<std::process::Command, Stri
     Ok(command)
 }
 
+/// The self-update command: [`msi_command`] plus the properties that keep the installed copy's
+/// Windows Installer context (`msi_copy::update_arguments`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn reinstall_command(program: &Path, msi: &Path, context: &[&str]) -> Result<std::process::Command, String> {
+    let mut command = msi_command(program, msi)?;
+    command.args(context);
+    Ok(command)
+}
+
 /// Where `msi_command` asks Windows Installer to write its log.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn msi_log(msi: &Path) -> PathBuf {
@@ -1667,7 +1676,9 @@ pub(crate) fn msi_path(msi: &Path) -> Result<PathBuf, String> {
 pub mod windows {
     use crate::protocol::CANCELLED;
 
-    use super::{App, INSTALLER, JobPhase, Path, PathBuf, Stop, cancelled, msi_command, msi_folder_argument, msi_log, process, turn};
+    use super::{
+        App, INSTALLER, JobPhase, Path, PathBuf, Stop, cancelled, msi_command, msi_folder_argument, msi_log, process, reinstall_command, turn,
+    };
 
     fn msiexec() -> PathBuf {
         std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from).join(r"System32\msiexec.exe")
@@ -1700,11 +1711,15 @@ pub mod windows {
         })
     }
 
-    /// Runs the launcher's own new MSI for a self-update, with the same progress window and no
-    /// restart as [`run_msi`], and waits for it.
-    pub fn reinstall(msi: &Path) -> Result<(), String> {
-        let status = msi_command(&msiexec(), msi)?.status().map_err(|e| format!("couldn't start the Windows Installer ({e})"))?;
-        explain(status.code())
+    /// Runs an app's own new MSI for a self-update, with the same progress window and no restart
+    /// as [`run_msi`], and waits for it. `context` keeps the installed copy's Windows Installer
+    /// context. A failure names the installer's log, which is the only place 1603 is explained.
+    pub fn reinstall(msi: &Path, context: &[&str]) -> Result<(), String> {
+        let status = reinstall_command(&msiexec(), msi, context)?.status().map_err(|e| format!("couldn't start the Windows Installer ({e})"))?;
+        explain(status.code()).map_err(|e| match status.code() {
+            Some(1602) | None => e,
+            _ => format!("{e}. Its log is at {}", msi_log(msi).display()),
+        })
     }
 
     /// Runs `work` once no other Windows Installer job of ours is running (a second one would
@@ -1758,6 +1773,22 @@ mod tests {
                 file.canonicalize().unwrap().with_extension("log").as_os_str()
             ]
         );
+    }
+
+    #[test]
+    fn a_self_update_keeps_the_installed_copys_context_after_the_package_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("GridCraft.msi");
+        std::fs::write(&file, b"test package").unwrap();
+        let resolved = msi_path(&file).unwrap();
+        for context in [&["ALLUSERS=1"][..], &["ALLUSERS=2", "MSIINSTALLPERUSER=1"], &[]] {
+            let command = reinstall_command(Path::new("msiexec.exe"), &file, context).unwrap();
+            let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+            let mut expected: Vec<String> = ["/i", &resolved.to_string_lossy(), "/passive", "/norestart", "/l*v"].map(String::from).to_vec();
+            expected.push(resolved.with_extension("log").to_string_lossy().into_owned());
+            expected.extend(context.iter().map(|p| p.to_string()));
+            assert_eq!(args, expected);
+        }
     }
 
     #[test]

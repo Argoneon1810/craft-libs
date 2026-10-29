@@ -10,6 +10,8 @@ mod folders;
 pub mod http;
 pub mod install;
 pub mod manifest;
+pub mod msi_context;
+mod msi_copy;
 pub mod packages;
 pub mod paths;
 pub mod platform;
