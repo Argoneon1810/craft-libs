@@ -124,9 +124,11 @@ pub(crate) mod windows {
         let resolved = crate::msi_copy::windows::resolve(app, exe)?;
         let dir = exe.parent().ok_or_else(|| format!("{} isn't in a folder", app.name))?;
         let dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        // Resolved like `dir`, so a profile behind a junction or a `subst` drive still matches.
+        let canonical = |p: PathBuf| dunce::canonicalize(&p).unwrap_or(p);
         let profile = Profile {
-            roots: ["USERPROFILE", "LOCALAPPDATA", "APPDATA"].into_iter().filter_map(env_path).collect(),
-            local_app_data: crate::folders::data_local_dir(),
+            roots: ["USERPROFILE", "LOCALAPPDATA", "APPDATA"].into_iter().filter_map(env_path).map(canonical).collect(),
+            local_app_data: crate::folders::data_local_dir().map(canonical),
         };
         // This process has the package's architecture (the helper is a copy of the app), so its
         // own `ProgramFiles` is the right root: `Program Files (x86)` for a 32-bit app.
@@ -192,7 +194,10 @@ mod tests {
     #[test]
     fn a_per_user_copy_in_a_default_folder_moves_to_the_suite_folder() {
         for old in [r"C:\Users\Ann\AppData\Local\Programs\ArtCraft\GridCraft", r"c:\users\ann\appdata\local\programs\gridcraft\"] {
-            assert_eq!(plan(user(), &p(old), "GridCraft", &profile(), pf()), moved(r"C:\Program Files\ArtCraft\GridCraft", old));
+            // Joined like the plan joins it: `\` on Windows, `/` where these tests also run.
+            let suite = pf().map(|root| root.join("ArtCraft").join("GridCraft")).unwrap();
+            let expected = Step::Move { product_code: CODE.to_string(), folder: suite, old_folder: p(old) };
+            assert_eq!(plan(user(), &p(old), "GridCraft", &profile(), pf()), expected);
         }
     }
 

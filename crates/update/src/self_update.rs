@@ -208,6 +208,13 @@ fn msi_step(app: &App, exe: &Path) -> Result<crate::msi_migrate::Step, String> {
     crate::msi_migrate::windows::step(app, exe)
 }
 
+/// Whether the helper starts the app after the update step: always after a successful one, and
+/// after a failed one only while its exe is still there.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn restarts(step_succeeded: bool, exe_exists: bool) -> bool {
+    step_succeeded || exe_exists
+}
+
 /// The exe to start after an MSI update of a registered copy: the one its registrations name now
 /// (the package may have moved an exact old default folder), else `exe`.
 #[cfg(windows)]
@@ -642,6 +649,11 @@ pub fn finish(app: &App, args: &[OsString]) -> Option<Result<(), String>> {
     }
     // The new app, or the old one when the step failed.
     let exe = if done.is_ok() { exe_after_msi(app, registered, &exe) } else { exe };
+    // A failed move can leave no program to start; its recorded error already says how to get
+    // the app back, and a restart error must not replace it.
+    if !restarts(done.is_ok(), exe.is_file()) {
+        return Some(done);
+    }
     let started = signed_like(app, &me, &exe)
         .and_then(|()| process::spawn_detached(std::process::Command::new(&exe)).map_err(|e| format!("couldn't start {} ({e})", exe.display())));
     if let Err(e) = &started {
@@ -1721,6 +1733,14 @@ mod tests {
         assert_eq!(pick(Os::Linux, Install::Package(PackageKind::Deb, PathBuf::new()).kind()).as_deref(), Some(names[4]));
         assert_eq!(pick(Os::Linux, Install::Flatpak.kind()).as_deref(), Some(names[5]));
         assert_eq!(pick(Os::Linux, Install::Package(PackageKind::ArchPkg, PathBuf::new()).kind()).as_deref(), Some(names[6]));
+    }
+
+    #[test]
+    fn a_failed_step_that_removed_the_app_starts_nothing_and_keeps_its_message() {
+        assert!(restarts(true, true));
+        assert!(restarts(true, false));
+        assert!(restarts(false, true));
+        assert!(!restarts(false, false));
     }
 
     #[test]
