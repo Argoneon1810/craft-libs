@@ -8,9 +8,11 @@
 //!
 //! Which context to update in is a separate, slower question that only an update asks. Windows
 //! Installer's own registration answers it ([`crate::msi_context`]), as it does for the launcher;
-//! the `App Paths` hive is only the fallback when that lookup cannot run at all. So a copy
-//! installed for everyone is never unpacked over without permission, and a per-user copy never
-//! gains a second, per-machine twin.
+//! the `App Paths` hive is only the fallback when that lookup cannot run at all. The answer must
+//! match the hive that named this exe: a package writes `App Paths` under `HKMU`, which is always
+//! the hive of its own context, so a registration in the other context belongs to another copy and
+//! the update stops. So a copy installed for everyone is never unpacked over without permission,
+//! and a per-user copy never gains a second, per-machine twin or takes another copy's context.
 //!
 //! The launcher's own per-user MSI is still recognised by the folder it records in HKCU (or its
 //! default folder) and updated exactly as before, with the package's own default context.
@@ -34,12 +36,14 @@ pub(crate) enum MsiCopy {
 
 const CONFLICTING: &str =
     "this app is registered both for your account and for everyone, so it can't tell which copy to update. Use the app's installer instead.";
+const ANOTHER_COPY: &str = "Windows lists this app for a different account setting than this copy, so it can't be sure which copy it would update. Use the app's installer instead.";
 const NOT_ONE_PRODUCT: &str =
     "Windows lists this app's installation more than once or not at all, so it can't tell which copy to update. Use the app's installer instead.";
 
 /// The `msiexec` properties for `copy`'s update. `product_codes` are the app's Windows Installer
 /// registrations; `probe` asks Windows Installer for one product's context. Exactly one product
-/// must be registered: with two, either could be the copy that runs.
+/// must be registered: with two, either could be the copy that runs. Its context must be the
+/// context of the hive that named this exe, or the registration is another copy's.
 pub(crate) fn update_arguments(
     copy: MsiCopy,
     product_codes: &[String],
@@ -52,6 +56,9 @@ pub(crate) fn update_arguments(
     };
     let [code] = product_codes else { return Err(NOT_ONE_PRODUCT.into()) };
     let scope = crate::msi_context::update_scope(true, Some(code), probe, |_| Some(hive))?.ok_or(NOT_ONE_PRODUCT)?;
+    if scope != hive {
+        return Err(ANOTHER_COPY.into());
+    }
     Ok(crate::msi_context::scope_arguments(scope))
 }
 
@@ -93,6 +100,8 @@ pub(crate) mod windows {
     use super::{MsiCopy, MsiScope, app_path_value, match_registration};
     use crate::app::App;
 
+    /// `path` with links and `..` resolved in ordinary drive syntax, or as given when it cannot be
+    /// resolved, so registry values and the running exe compare in one form.
     fn canonical(path: &Path) -> PathBuf {
         dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
@@ -152,6 +161,7 @@ pub(crate) mod windows {
         [recorded, default].into_iter().flatten().any(|d| d == dir)
     }
 
+    /// The install folder the launcher's per-user wizard records in HKCU, when it recorded one.
     fn recorded_dir(app: &App) -> Option<PathBuf> {
         let key = RegKey::predef(HKEY_CURRENT_USER).open_subkey(format!(r"Software\Learning Machines LLC\{}", app.name)).ok()?;
         let dir: String = key.get_value("InstallDir").ok()?;
@@ -201,11 +211,19 @@ mod tests {
     }
 
     #[test]
-    fn windows_installer_decides_the_context_not_the_hive() {
-        let copy = MsiCopy::Registered { hive: MsiScope::PerUser };
-        assert_eq!(update_arguments(copy, &codes(&[CODE]), |_| Ok(MsiScope::PerMachine)).unwrap(), ["ALLUSERS=1"]);
+    fn windows_installer_confirms_the_context_of_the_hive_that_named_the_exe() {
         let copy = MsiCopy::Registered { hive: MsiScope::PerMachine };
+        assert_eq!(update_arguments(copy, &codes(&[CODE]), |_| Ok(MsiScope::PerMachine)).unwrap(), ["ALLUSERS=1"]);
+        let copy = MsiCopy::Registered { hive: MsiScope::PerUser };
         assert_eq!(update_arguments(copy, &codes(&[CODE]), |_| Ok(MsiScope::PerUser)).unwrap(), ["ALLUSERS=2", "MSIINSTALLPERUSER=1"]);
+    }
+
+    #[test]
+    fn a_registration_in_the_other_context_is_another_copys_and_stops_the_update() {
+        for (hive, other) in [(MsiScope::PerUser, MsiScope::PerMachine), (MsiScope::PerMachine, MsiScope::PerUser)] {
+            let error = update_arguments(MsiCopy::Registered { hive }, &codes(&[CODE]), |_| Ok(other)).unwrap_err();
+            assert_eq!(error, ANOTHER_COPY);
+        }
     }
 
     #[test]

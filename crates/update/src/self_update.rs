@@ -182,6 +182,8 @@ fn detect(app: &App, exe: &Path) -> Option<Install> {
     None
 }
 
+/// How the Windows copy at `exe` was installed: portable (a `portable.txt` beside it), by its MSI
+/// (registered in either context, or the launcher's own per-user package), else a loose folder.
 #[cfg(windows)]
 fn detect(app: &App, exe: &Path) -> Option<Install> {
     let dir = exe.parent()?;

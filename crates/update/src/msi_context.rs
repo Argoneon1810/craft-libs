@@ -85,6 +85,8 @@ pub fn install_scope(updated: Option<MsiScope>, fresh: bool) -> Option<MsiScope>
     updated.or_else(|| fresh.then_some(MsiScope::PerMachine))
 }
 
+/// Whether `code` is a braced Windows Installer product GUID, the only text ever placed in the
+/// lookup script.
 pub fn valid_product_code(code: &str) -> bool {
     code.len() == 38
         && code.bytes().enumerate().all(|(index, byte)| match index {
@@ -95,6 +97,8 @@ pub fn valid_product_code(code: &str) -> bool {
         })
 }
 
+/// The one context in the lookup's output (one `MSIINSTALLCONTEXT` number per line): 1 and 2 are
+/// an account (managed or not), 4 the machine. Anything else is unclear, and two contexts conflict.
 fn parse_contexts(output: &str) -> Result<MsiScope, ProbeError> {
     let mut scope = None;
     for line in output.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -111,6 +115,8 @@ fn parse_contexts(output: &str) -> Result<MsiScope, ProbeError> {
     scope.ok_or(ProbeError::Unknown)
 }
 
+/// Asks Windows Installer, read-only, which context `product_code` is installed in, for this
+/// account and the machine. Runs PowerShell with a 10 second limit.
 #[cfg(windows)]
 pub fn probe(product_code: &str) -> Result<MsiScope, ProbeError> {
     use std::path::PathBuf;
