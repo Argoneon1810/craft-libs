@@ -8,7 +8,8 @@
 //!
 //! Which context to update in is a separate, slower question that only an update asks. Windows
 //! Installer's own registration answers it ([`crate::msi_context`]), as it does for the launcher;
-//! the `App Paths` hive is only the fallback when that lookup cannot run at all. The answer must
+//! only when that lookup cannot run at all do the product's own uninstall records answer, and
+//! only when they all agree. The answer must
 //! match the hive that named this exe: a package writes `App Paths` under `HKMU`, which is always
 //! the hive of its own context, so a registration in the other context belongs to another copy and
 //! the update stops. So a copy installed for everyone is never unpacked over without permission,
@@ -42,13 +43,16 @@ const NOT_ONE_PRODUCT: &str =
     "Windows lists this app's installation more than once or not at all, so it can't tell which copy to update. Use the app's installer instead.";
 
 /// The `msiexec` properties for `copy`'s update. `product_codes` are the app's Windows Installer
-/// registrations; `probe` asks Windows Installer for one product's context. Exactly one product
-/// must be registered: with two, either could be the copy that runs. Its context must be the
-/// context of the hive that named this exe, or the registration is another copy's.
+/// registrations; `probe` asks Windows Installer for one product's context, and `record_scopes`
+/// lists the context of every uninstall record of that product, read only when the lookup cannot
+/// run. Exactly one product must be registered: with two, either could be the copy that runs. The
+/// records must agree on one context. Whichever answers, it must be the context of the hive that
+/// named this exe, or the registration is another copy's.
 pub(crate) fn update_arguments(
     copy: MsiCopy,
     product_codes: &[String],
     probe: impl FnOnce(&str) -> Result<MsiScope, crate::msi_context::ProbeError>,
+    record_scopes: impl FnOnce(&str) -> Vec<MsiScope>,
 ) -> Result<&'static [&'static str], String> {
     let hive = match copy {
         MsiCopy::Legacy => return Ok(&[]),
@@ -56,7 +60,8 @@ pub(crate) fn update_arguments(
         MsiCopy::Registered { hive } => hive,
     };
     let [code] = product_codes else { return Err(NOT_ONE_PRODUCT.into()) };
-    let scope = crate::msi_context::update_scope(true, Some(code), probe, |_| Some(hive))?.ok_or(NOT_ONE_PRODUCT)?;
+    let fallback = |code: &str| crate::msi_context::single_scope(record_scopes(code));
+    let scope = crate::msi_context::update_scope(true, Some(code), probe, fallback)?.ok_or(NOT_ONE_PRODUCT)?;
     if scope != hive {
         return Err(ANOTHER_COPY.into());
     }
@@ -159,7 +164,26 @@ pub(crate) mod windows {
             .map(|m| m.product_code)
             .filter(|code| crate::msi_context::valid_product_code(code))
             .collect();
-        super::update_arguments(copy, &codes, crate::msi_context::probe)
+        super::update_arguments(copy, &codes, crate::msi_context::probe, record_scopes)
+    }
+
+    /// The context of every uninstall record of `code`: the machine's (both registry views) are
+    /// per-machine, the account's own per-user. Two views of one machine record count once.
+    fn record_scopes(code: &str) -> Vec<MsiScope> {
+        const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        let roots = [
+            (HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY, MsiScope::PerMachine),
+            (HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY, MsiScope::PerMachine),
+            (HKEY_CURRENT_USER, 0, MsiScope::PerUser),
+        ];
+        let mut scopes = Vec::new();
+        for (hive, flags, scope) in roots {
+            let found = RegKey::predef(hive).open_subkey_with_flags(format!(r"{UNINSTALL}\{code}"), KEY_READ | flags).is_ok();
+            if found && !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+        }
+        scopes
     }
 
     /// The launcher's own per-user MSI: the folder its wizard records in HKCU, or its default
@@ -217,41 +241,58 @@ mod tests {
         let exe = p(r"C:\Program Files\ArtCraft\GridCraft\gridcraft.exe");
         let copy = match_registration(&exe, &[(MsiScope::PerMachine, exe.clone()), (MsiScope::PerUser, exe.clone())]).unwrap();
         assert_eq!(copy, MsiCopy::Conflicting);
-        assert!(update_arguments(copy, &codes(&[CODE]), |_| panic!("must not look up")).is_err());
+        assert!(update_arguments(copy, &codes(&[CODE]), |_| panic!("must not look up"), |_| panic!("must not read the records")).is_err());
     }
 
     #[test]
     fn windows_installer_confirms_the_context_of_the_hive_that_named_the_exe() {
         let copy = MsiCopy::Registered { hive: MsiScope::PerMachine };
-        assert_eq!(update_arguments(copy, &codes(&[CODE]), |_| Ok(MsiScope::PerMachine)).unwrap(), ["ALLUSERS=1"]);
+        assert_eq!(
+            update_arguments(copy, &codes(&[CODE]), |_| Ok(MsiScope::PerMachine), |_| panic!("must not read the records")).unwrap(),
+            ["ALLUSERS=1"]
+        );
         let copy = MsiCopy::Registered { hive: MsiScope::PerUser };
-        assert_eq!(update_arguments(copy, &codes(&[CODE]), |_| Ok(MsiScope::PerUser)).unwrap(), ["ALLUSERS=2", "MSIINSTALLPERUSER=1"]);
+        assert_eq!(
+            update_arguments(copy, &codes(&[CODE]), |_| Ok(MsiScope::PerUser), |_| panic!("must not read the records")).unwrap(),
+            ["ALLUSERS=2", "MSIINSTALLPERUSER=1"]
+        );
     }
 
     #[test]
     fn a_registration_in_the_other_context_is_another_copys_and_stops_the_update() {
         for (hive, other) in [(MsiScope::PerUser, MsiScope::PerMachine), (MsiScope::PerMachine, MsiScope::PerUser)] {
-            let error = update_arguments(MsiCopy::Registered { hive }, &codes(&[CODE]), |_| Ok(other)).unwrap_err();
+            let error =
+                update_arguments(MsiCopy::Registered { hive }, &codes(&[CODE]), |_| Ok(other), |_| panic!("must not read the records")).unwrap_err();
             assert_eq!(error, ANOTHER_COPY);
         }
     }
 
     #[test]
-    fn the_hive_is_only_the_fallback_when_the_lookup_cannot_run() {
+    fn the_uninstall_records_answer_only_when_the_lookup_cannot_run() {
         let copy = MsiCopy::Registered { hive: MsiScope::PerMachine };
         let blocked = |_: &str| Err(ProbeError::Unavailable("PowerShell is blocked".into()));
-        assert_eq!(update_arguments(copy, &codes(&[CODE]), blocked).unwrap(), ["ALLUSERS=1"]);
+        assert_eq!(update_arguments(copy, &codes(&[CODE]), blocked, |_| vec![MsiScope::PerMachine]).unwrap(), ["ALLUSERS=1"]);
         for unclear in [ProbeError::Unknown, ProbeError::Conflicting] {
-            assert!(update_arguments(copy, &codes(&[CODE]), |_| Err(unclear)).is_err());
+            assert!(update_arguments(copy, &codes(&[CODE]), |_| Err(unclear), |_| panic!("must not read the records")).is_err());
         }
+    }
+
+    #[test]
+    fn missing_mixed_or_mismatched_records_stop_the_fallback() {
+        let copy = MsiCopy::Registered { hive: MsiScope::PerMachine };
+        let blocked = |_: &str| Err(ProbeError::Unavailable("PowerShell is blocked".into()));
+        assert!(update_arguments(copy, &codes(&[CODE]), blocked, |_| vec![]).is_err());
+        assert!(update_arguments(copy, &codes(&[CODE]), blocked, |_| vec![MsiScope::PerMachine, MsiScope::PerUser]).is_err());
+        let error = update_arguments(copy, &codes(&[CODE]), blocked, |_| vec![MsiScope::PerUser]).unwrap_err();
+        assert_eq!(error, ANOTHER_COPY);
     }
 
     #[test]
     fn the_update_stops_unless_exactly_one_product_is_registered() {
         let copy = MsiCopy::Registered { hive: MsiScope::PerMachine };
-        assert!(update_arguments(copy, &[], |_| panic!("must not look up")).is_err());
+        assert!(update_arguments(copy, &[], |_| panic!("must not look up"), |_| panic!("must not read the records")).is_err());
         let two = codes(&[CODE, "{0BE5923F-1AAB-4240-8174-2F0CCC05E14C}"]);
-        assert!(update_arguments(copy, &two, |_| panic!("must not look up")).is_err());
+        assert!(update_arguments(copy, &two, |_| panic!("must not look up"), |_| panic!("must not read the records")).is_err());
     }
 
     #[test]
@@ -273,7 +314,7 @@ mod tests {
 
     #[test]
     fn the_launchers_own_package_keeps_its_default() {
-        assert!(update_arguments(MsiCopy::Legacy, &[], |_| panic!("must not look up")).unwrap().is_empty());
+        assert!(update_arguments(MsiCopy::Legacy, &[], |_| panic!("must not look up"), |_| panic!("must not read the records")).unwrap().is_empty());
     }
 
     #[test]
